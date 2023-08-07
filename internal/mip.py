@@ -156,8 +156,9 @@ def cast_rays(t_vals, origins, directions, radii, ray_shape, diag=True):
   means = means + origins[Ellipsis, None, :]
   return means, covs
 
-
-def integrated_pos_enc(x_coord, min_deg, max_deg, diag=True):
+## ------ append original coords to encoded coords ------ ##
+def integrated_pos_enc(x_coord, min_deg, max_deg, diag=True, append_identity=True):
+## ------------------------------------------------------ ##
   """Encode `x` with sinusoids scaled by 2^[min_deg:max_deg-1].
 
   Args:
@@ -186,10 +187,15 @@ def integrated_pos_enc(x_coord, min_deg, max_deg, diag=True):
     # Get the diagonal of a covariance matrix (ie, variance). This is equivalent
     # to jax.vmap(jnp.diag)((basis.T @ covs) @ basis).
     y_var = jnp.sum((math.matmul(x_cov, basis)) * basis, -2)
-
-  return expected_sin(
+  ## ------ append original coords to encoded coords ------ ##
+  encoded = expected_sin(
       jnp.concatenate([y, y + 0.5 * jnp.pi], axis=-1),
       jnp.concatenate([y_var] * 2, axis=-1))
+  if append_identity:
+    return jnp.concatenate([x] + [encoded], axis=-1)
+  else:
+    return encoded
+  ## ------------------------------------------------------ ##
 
 
 def compute_alpha_weights(density, t_vals, dirs, weights_aux=False):
@@ -418,3 +424,44 @@ def resample_along_rays(rng,
   means, covs = cast_rays(
       new_t_vals, origins, directions, radii, ray_shape, diag=diag)
   return new_t_vals, (means, covs)
+
+## -------- add-on for distortion loss ---------------- ##
+# This loss is for ablation. FreeNeRF doesn't use distortion loss.
+def construct_ray_warps(fn, t_near, t_far):
+  """Construct a bijection between metric distances and normalized distances.
+
+  See the text around Equation 11 in https://arxiv.org/abs/2111.12077 for a
+  detailed explanation.
+
+  Args:
+    fn: the function to ray distances.
+    t_near: a tensor of near-plane distances.
+    t_far: a tensor of far-plane distances.
+
+  Returns:
+    t_to_s: a function that maps distances to normalized distances in [0, 1].
+    s_to_t: the inverse of t_to_s.
+  """
+  if fn is None:
+    fn_fwd = lambda x: x
+    fn_inv = lambda x: x
+  elif fn == 'piecewise':
+    # Piecewise spacing combining identity and 1/x functions to allow t_near=0.
+    fn_fwd = lambda x: jnp.where(x < 1, .5 * x, 1 - .5 / x)
+    fn_inv = lambda x: jnp.where(x < .5, 2 * x, .5 / (1 - x))
+  else:
+    inv_mapping = {
+        'reciprocal': jnp.reciprocal,
+        'log': jnp.exp,
+        'exp': jnp.log,
+        'sqrt': jnp.square,
+        'square': jnp.sqrt
+    }
+    fn_fwd = fn
+    fn_inv = inv_mapping[fn.__name__]
+
+  s_near, s_far = [fn_fwd(x) for x in (t_near, t_far)]
+  t_to_s = lambda t: (fn_fwd(t) - s_near) / (s_far - s_near)
+  s_to_t = lambda s: fn_inv(s * s_far + (1 - s) * s_near)
+  return t_to_s, s_to_t
+## -------------------------------------------------------- ##

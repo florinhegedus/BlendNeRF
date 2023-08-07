@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Training script for MixNerf."""
+"""Training script for RegNerf."""
 
 import functools
 import gc
@@ -42,6 +42,7 @@ class TrainStats:
   """Collection of stats for logging."""
   loss: float
   losses: float
+  losses_georeg: float
   disp_mses: float
   normal_maes: float
   weight_l2: float
@@ -119,13 +120,16 @@ def train_step(
         tree_sum(jax.tree_map(lambda z: jnp.sum(z**2), variables)) / tree_sum(
             jax.tree_map(lambda z: jnp.prod(jnp.array(z.shape)), variables)))
 
-    renderings = model.apply(
+    ## -- add ray_history as output for occ_reg or distortion loss -- ##
+    renderings, ray_history = model.apply(
+    ## -------------------------------------------------------------- ##
         variables,
         key if config.randomized else None,
         batch['rays'],
         resample_padding=resample_padding,
         compute_extras=(config.compute_disp_metrics or
-                        config.compute_normal_metrics))
+                        config.compute_normal_metrics),
+        freq_reg_mask=batch['freq_reg_mask'] if config.freq_reg else None)
     lossmult = batch['rays'].lossmult
     if config.disable_multiscale_loss:
       lossmult = jnp.ones_like(lossmult)
@@ -176,12 +180,15 @@ def train_step(
                           (config.depth_tvnorm_decay))
     if render_random_rays:
       losses_georeg = []
-      renderings_random = model.apply(
+      renderings_random, _ = model.apply(
           variables,
           key2 if config.randomized else None,
           batch['rays_random'],
           resample_padding=resample_padding,
-          compute_extras=True)
+          compute_extras=True,
+          ## ---- add freq_reg_mask as input ---- ##
+          freq_reg_mask=batch['freq_reg_mask'] if config.freq_reg else None)
+          ## ------------------------------------ ##
       ps = config.patch_size
       reshape_to_patch = lambda x, dim: x.reshape(-1, ps, ps, dim)
       for i, rendering in enumerate(renderings_random):
@@ -196,8 +203,12 @@ def train_step(
                                         weighting).mean())
         else:
           losses_georeg.append(0.0)
-
+    ## ---- if not using random rays, set losses_georeg to 0 -- ##
+    else:
+      losses_georeg = [0.0]
+    ## -------------------------------------------------------- ##
     losses = jnp.array(losses)
+    losses_georeg = jnp.array(losses_georeg)
     disp_mses = jnp.array(disp_mses)
     normal_maes = jnp.array(normal_maes)
     loss = (losses[-1] +
@@ -206,17 +217,41 @@ def train_step(
             config.raydepth_nll_weight * losses[2] +
             config.remodel_nll_weight * losses[3] +
             config.weight_decay_mult * weight_l2)
+    
+    ## ---- if using distortion loss --- ##
+    if config.distortion_loss_mult > 0.0:
+      last_ray_results = ray_history[-1]
+      c = last_ray_results['sdist']
+      w = last_ray_results['weights']
+      distoration_loss = jnp.mean(math.lossfun_distortion(c, w))
+      distoration_loss = config.distortion_loss_mult * distoration_loss
+      loss += distoration_loss
+    ## --------------------------------- ##
+    
+    ## ---- if using occ reg loss ------ ##
+    if config.occ_reg_loss_mult > 0.0:
+      last_ray_results = ray_history[-1]
+      rgb = last_ray_results['rgb']
+      density = last_ray_results['density']
+      occ_reg_loss = jnp.mean(math.lossfun_occ_reg(
+        rgb, density, reg_range=config.occ_reg_range,
+        # wb means white&black prior in DTU
+        wb_prior=config.occ_wb_prior, wb_range=config.occ_wb_range)) 
+      occ_reg_loss = config.occ_reg_loss_mult * occ_reg_loss
+      loss += occ_reg_loss
+    ## --------------------------------- ##
 
-    return loss, (losses, disp_mses, normal_maes, weight_l2)
+    return loss, (losses, disp_mses, normal_maes, weight_l2, losses_georeg)
 
   (loss, loss_aux), grad = (jax.value_and_grad(loss_fn, has_aux=True)(
       state.optimizer.target))
-  (losses, disp_mses, normal_maes, weight_l2) = loss_aux
+  (losses, disp_mses, normal_maes, weight_l2, losses_georeg) = loss_aux
   grad = jax.lax.pmean(grad, axis_name='batch')
   losses = jax.lax.pmean(losses, axis_name='batch')
   disp_mses = jax.lax.pmean(disp_mses, axis_name='batch')
   normal_maes = jax.lax.pmean(normal_maes, axis_name='batch')
   weight_l2 = jax.lax.pmean(weight_l2, axis_name='batch')
+  losses_georeg = jax.lax.pmean(losses_georeg, axis_name='batch')
 
   if config.check_grad_for_nans:
     grad = jax.tree_map(jnp.nan_to_num, grad)
@@ -243,6 +278,7 @@ def train_step(
   stats = TrainStats(
       loss=loss,
       losses=losses,
+      losses_georeg=losses_georeg,
       disp_mses=disp_mses,
       normal_maes=normal_maes,
       weight_l2=weight_l2,
@@ -332,6 +368,12 @@ def main(unused_argv):
   avg_psnr_denom = 0
   train_start_time = time.time()
   for step, batch in zip(range(init_step, config.max_steps + 1), pdataset):
+    ## ---- a tricky way to use freq_reg_mask ------------- ##
+    if config.freq_reg:
+      batch['freq_reg_mask'] = (
+        math.get_freq_reg_mask(99, step, config.freq_reg_end, config.max_vis_freq_ratio).tile((batch['rays'].origins.shape[0], 1)),
+        math.get_freq_reg_mask(27, step, config.freq_reg_end, config.max_vis_freq_ratio).tile((batch['rays'].origins.shape[0], 1)))
+    ## ------------------------------------------- ##
 
     learning_rate = math.learning_rate_decay(
         step,
@@ -434,6 +476,26 @@ def main(unused_argv):
 
     # Test-set evaluation.
     if config.train_render_every > 0 and step % config.train_render_every == 0:
+      if config.freq_reg:
+        ## -- re-defining the rendering eval function to use current freq_reg_mask -- ##
+        freq_reg_mask = (
+          math.get_freq_reg_mask(99, step, config.freq_reg_end, config.max_vis_freq_ratio),
+          math.get_freq_reg_mask(27, step, config.freq_reg_end, config.max_vis_freq_ratio))
+        def render_eval_fn(variables, _, rays):
+            return jax.lax.all_gather(
+              model.apply(
+                  variables,
+                  None,  # Deterministic.
+                  rays,
+                  resample_padding=config.resample_padding_final,
+                  compute_extras=True, freq_reg_mask=freq_reg_mask)[0], axis_name='batch')
+
+        render_eval_pfn = jax.pmap(
+            render_eval_fn,
+            axis_name='batch',
+            in_axes=(None, None, 0),  # Only distribute the data input.
+            donate_argnums=(3,))
+      ## ---------------------------------------------------------------------- ##
       # We reuse the same random number generator from the optimization step
       # here on purpose so that the visualization matches what happened in
       # training.

@@ -1,6 +1,6 @@
 # LLFF settings
 Config.data_dir = "../nerf_llff_data"
-Config.checkpoint_dir = "out/mixnerf_llff6_trex"
+Config.checkpoint_dir = "out/mixnerf_llff6_trex_"
 Config.dataset_loader = 'llff'
 Config.llff_scan = 'trex'
 Config.white_background = False
@@ -38,4 +38,14 @@ Config.remodel_nll_weight = 1e-6
 ############## mixnerf ##############
 
 Config.train_render_every = 5000
+Config.load_random_rays = False
+
+# use trick or not
+Config.freq_reg = True
+Config.freq_reg_end = 97675 # int(0.7 * Config.max_steps)
+
+Config.occ_reg_loss_mult = 0.01
+Config.occ_reg_range = 20
+Config.occ_wb_prior = False
+
 Config.load_random_rays = False

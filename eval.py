@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Evaluation script for MixNeRF."""
+"""Evaluation script for RegNeRF."""
 import functools
 from os import path
 import time
@@ -51,25 +51,6 @@ def main(unused_argv):
   optimizer = flax.optim.Adam(config.lr_init).create(init_variables)
   state = utils.TrainState(optimizer=optimizer)
   del optimizer, init_variables
-
-  # Rendering is forced to be deterministic even if training was randomized, as
-  # this eliminates 'speckle' artifacts.
-  def render_eval_fn(variables, _, rays):
-    return jax.lax.all_gather(
-        model.apply(
-            variables,
-            None,  # Deterministic.
-            rays,
-            resample_padding=config.resample_padding_final,
-            compute_extras=True), axis_name='batch')
-
-  # pmap over only the data input.
-  render_eval_pfn = jax.pmap(
-      render_eval_fn,
-      in_axes=(None, None, 0),
-      donate_argnums=2,
-      axis_name='batch',
-  )
 
   def ssim_fn(x, y):
     return structural_similarity(x, y, multichannel=True, data_range=1.0, win_size=11, gaussian_weights=True, sigma=1.5, use_sample_covariance=False, K1=0.01, K2=0.03)
@@ -134,6 +115,38 @@ def main(unused_argv):
       state = flax.serialization.from_state_dict(state, state_dict)
 
     step = int(state.optimizer.state.step)
+
+    if config.freq_reg:
+      # Rendering is forced to be deterministic even if training was randomized, as
+      # this eliminates 'speckle' artifacts.
+      freq_reg_mask = (
+        math.get_freq_reg_mask(99, step, config.freq_reg_end, config.max_vis_freq_ratio),
+        math.get_freq_reg_mask(27, step, config.freq_reg_end, config.max_vis_freq_ratio))
+      def render_eval_fn(variables, _, rays):
+        return jax.lax.all_gather(
+            model.apply(
+                variables,
+                None,  # Deterministic.
+                rays,
+                resample_padding=config.resample_padding_final,
+                compute_extras=True,
+                freq_reg_mask=freq_reg_mask)[0], axis_name='batch')
+    else:
+      def render_eval_fn(variables, _, rays):
+        return jax.lax.all_gather(
+            model.apply(
+                variables,
+                None,  # Deterministic.
+                rays,
+                resample_padding=config.resample_padding_final,
+                compute_extras=True)[0], axis_name='batch')
+    # pmap over only the data input.
+    render_eval_pfn = jax.pmap(
+        render_eval_fn,
+        in_axes=(None, None, 0),
+        donate_argnums=2,
+        axis_name='batch',
+    )
     if step <= last_step:
       print(f'Checkpoint step {step} <= last step {last_step}, sleeping.')
       time.sleep(10)

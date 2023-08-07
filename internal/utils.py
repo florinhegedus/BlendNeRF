@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from PIL import Image
+from PIL import ExifTags
 
 
 @flax.struct.dataclass
@@ -57,7 +58,9 @@ def isdir(pth):
 
 
 def makedirs(pth):
-  os.makedirs(pth)
+  ## --- modified for better compatibility ----
+  os.makedirs(pth, exist_ok=True)
+  ## ------------------------------------------
 
 
 def shard(xs):
@@ -78,6 +81,27 @@ def unshard(x, padding=0):
     y = y[:-padding]
   return y
 
+#--- to support function "create_video()" ----
+def load_img(pth: str):
+  """Load an image and cast to float32."""
+  with open_file(pth, 'rb') as f:
+    image = np.array(Image.open(f), dtype=np.float32)
+  return image
+
+
+#--- to support function "create_video()" ----
+def load_exif(pth: str):
+  """Load EXIF data for an image."""
+  with open_file(pth, 'rb') as f:
+    image_pil = Image.open(f)
+    exif_pil = image_pil._getexif()  # pylint: disable=protected-access
+    if exif_pil is not None:
+      exif = {
+          ExifTags.TAGS[k]: v for k, v in exif_pil.items() if k in ExifTags.TAGS
+      }
+    else:
+      exif = {}
+  return exif
 
 def dataclass_map(fn, x):
   """Behaves like jax.tree_map but doesn't recurse on fields of a dataclass."""
@@ -96,5 +120,3 @@ def save_img_f32(depthmap, pth):
   """Save an image (probably a depthmap) to disk as a float32 TIFF."""
   with open_file(pth, 'wb') as f:
     Image.fromarray(np.nan_to_num(depthmap).astype(np.float32)).save(f, 'TIFF')
-
-

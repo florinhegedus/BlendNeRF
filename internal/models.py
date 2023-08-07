@@ -46,6 +46,9 @@ class MipNerfModel(nn.Module):
       rays,
       resample_padding,
       compute_extras,
+      ## -- add frequency regularization -- ##
+      freq_reg_mask=None,
+      ## ---------------------------------- ##
   ):
     """The mip-NeRF Model.
 
@@ -60,6 +63,14 @@ class MipNerfModel(nn.Module):
     """
     # Construct the MLP.
     mlp = MLP()
+    ## --- FreeNeRF add-on -------- ##
+    if not self.config.freq_reg:
+      freq_reg_mask = (jnp.ones(99), jnp.ones(27))
+    else:
+      freq_reg_mask = freq_reg_mask
+    t_to_s, s_to_t = mip.construct_ray_warps(None, rays.near, rays.far)
+    ray_history = []
+    ## ---------------------------- ##
 
     renderings = []
     for i_level in range(self.num_levels):
@@ -100,10 +111,12 @@ class MipNerfModel(nn.Module):
         samples = (samples[0], jnp.zeros_like(samples[1]))
 
       # Point attribute predictions
+      ## ------ pass frequency regularization mask to MLP ------ ##
       if self.use_viewdirs:
-        (rgb, density, normals, gamma, mu_depth) = mlp(rng, samples, rays.viewdirs)
+        (rgb, density, normals, gamma, mu_depth) = mlp(rng, samples, rays.viewdirs, freq_reg_mask=freq_reg_mask)
       else:
-        (rgb, density, normals, gamma, mu_depth) = mlp(rng, samples, None)
+        (rgb, density, normals, gamma, mu_depth) = mlp(rng, samples, None, freq_reg_mask=freq_reg_mask)
+      ## ------------------------------------------------------- ##
 
       # Volumetric rendering.
       weights, _, trans, delta, dirs_norm = mip.compute_alpha_weights(
@@ -132,7 +145,12 @@ class MipNerfModel(nn.Module):
           pi_regen,
       )
       renderings.append(rendering)
-    return renderings
+    ## --- add ray history for occlusion reg or distortion loss ----- ##
+      ray_history.append(
+        {'weights': weights, 'rgb': rgb, 'density': density, 'sdist': t_to_s(t_vals)}
+      )
+    return renderings, ray_history
+    ## -------------------------------------------------------------- ##
 
 
 def construct_mipnerf(rng, rays, config):
@@ -151,7 +169,8 @@ def construct_mipnerf(rng, rays, config):
   ray = jax.tree_map(lambda x: jnp.reshape(x, [-1, x.shape[-1]])[:10], rays)
   model = MipNerfModel(config=config)
   init_variables = model.init(
-      rng, rng=None, rays=ray, resample_padding=0., compute_extras=False)
+      rng, rng=None, rays=ray, resample_padding=0., compute_extras=False,
+      freq_reg_mask=(jnp.ones(99), jnp.ones(27)))
   return model, init_variables
 
 
@@ -209,7 +228,9 @@ class MLP(nn.Module):
   num_mudepth_channels: int = 3
 
   @nn.compact
-  def __call__(self, rng, samples, viewdirs=None):
+  ## ---- add freq reg mask ----- ##
+  def __call__(self, rng, samples, viewdirs=None, freq_reg_mask=None):
+  ## ---------------------------- ##
     """Evaluate the MLP.
 
     Args:
@@ -231,11 +252,15 @@ class MLP(nn.Module):
 
     dense_layer = functools.partial(nn.Dense, kernel_init=self.weight_init)
 
-    def predict_density(rng, means, covs):
+    def predict_density(rng, means, covs, coord_freq_mask=None):
       """Helper function to output density."""
       # Encode input positions
       inputs = mip.integrated_pos_enc(
           (means, covs), self.min_deg_point, self.max_deg_point)
+      ## ---- add freq reg mask ----- ##
+      if coord_freq_mask is not None:
+        inputs = inputs * coord_freq_mask
+      ## ---------------------------- ##
       # Evaluate network to output density
       x = inputs
       for i in range(self.net_depth):
@@ -255,19 +280,36 @@ class MLP(nn.Module):
       return density, x
 
     means, covs = samples
+    ## ---- split freq reg mask to coordinates and viewdirs ----- ##
+    if freq_reg_mask is not None:
+      coord_freq_mask, viewdirs_freq_mask = freq_reg_mask
+      coord_freq_mask = coord_freq_mask.tile((means.shape[0], means.shape[1], 1))
+      if viewdirs is not None:
+        viewdirs_freq_mask = viewdirs_freq_mask.tile((viewdirs.shape[0], 1))
+      else:
+        viewdirs_freq_mask = None
+    else:
+      coord_freq_mask, viewdirs_freq_mask = None, None
+    ## ---------------------------------------------------------- ##
     if self.disable_normals:
-      density, x = predict_density(rng, means, covs)
+      density, x = predict_density(rng, means, covs, coord_freq_mask)
       normals = jnp.full_like(means, fill_value=jnp.nan)
     else:
       # Flatten the input so value_and_grad can be vmap'ed.
       means_flat = means.reshape([-1, means.shape[-1]])
       covs_flat = covs.reshape([-1] + list(covs.shape[len(means.shape) - 1:]))
+      ## ---- add freq reg mask ----- ##
+      if coord_freq_mask is not None:
+        coord_freq_mask_flat = coord_freq_mask.reshape([-1] + list(coord_freq_mask.shape[len(means.shape) - 1:]))
+      else:
+        coord_freq_mask_flat = None
+      ## ---------------------------- ##
       # Evaluate the network and its gradient on the flattened input.
       predict_density_and_grad_fn = jax.vmap(
           jax.value_and_grad(predict_density, argnums=1, has_aux=True),
-          in_axes=(None, 0, 0))
+          in_axes=(None, 0, 0, 0))
       (density_flat, x_flat), density_grad_flat = (
-          predict_density_and_grad_fn(rng, means_flat, covs_flat))
+          predict_density_and_grad_fn(rng, means_flat, covs_flat, coord_freq_mask_flat))
 
       # Unflatten the output.
       density = density_flat.reshape(means.shape[:-1])
@@ -283,6 +325,10 @@ class MLP(nn.Module):
       viewdirs_enc = mip.pos_enc(
           viewdirs, min_deg=0, max_deg=self.deg_view, append_identity=True)
       # Output of the first part of MLP.
+      ## ------------- apply freq reg mask ------------- ##
+      if viewdirs_freq_mask is not None:
+        viewdirs_enc = viewdirs_enc * viewdirs_freq_mask
+      ## ----------------------------------------------- ##
       bottleneck = dense_layer(self.net_width)(x)
       viewdirs_enc = jnp.broadcast_to(
           viewdirs_enc[Ellipsis, None, :],

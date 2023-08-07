@@ -48,6 +48,16 @@ gin.config.external_configurable(
 @dataclasses.dataclass
 class Config:
   """Configuration flags for everything."""
+  ## ------ FreeNeRF add-ons --------- ##
+  freq_reg: bool = False # Whether to use frequency regularization.
+  freq_reg_end: int = 35000 # The step to end frequency regularization.
+  distortion_loss_mult: float = 0.0 # The multiplier on the distortion loss.
+  occ_reg_loss_mult: float = 0.0 # The multiplier on the occlusion regularization loss.
+  occ_reg_range: int = 10 # The range of the occlusion regularization | number of penalized points.
+  occ_wb_prior: bool = False # Whether to use the white&black background prior in DTU for occ reg.
+  occ_wb_range: int = 15 # The range of the white&black prior for occ reg.
+  max_vis_freq_ratio: float = None  # The maximum ratio of visible frequency (None for no limit), ablation study.
+  ## ------ End of FreeNeRF add-ons --------- ##
   dataset_loader: str = 'dtu'  # The type of dataset loader to use.
   batching: str = 'single_image'  # Batch composition.
   batching_random: str = 'all_images'  # Batch composiiton for random views.
@@ -152,7 +162,7 @@ class Config:
   ############## mixnerf ##############
 
   # Only used by eval.py:
-  eval_only_once: bool = True  # If True evaluate the model only once, ow loop.
+  eval_only_once: bool = False  # If True evaluate the model only once, ow loop.
   eval_save_output: bool = True  # If True save predicted images to disk.
   eval_render_interval: int = 1  # The interval between images saved to disk.
   eval_disable_lpips: bool = False  # If True, disable LPIPS computation.
