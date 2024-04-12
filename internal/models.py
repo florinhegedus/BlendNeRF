@@ -264,10 +264,12 @@ class MLP(nn.Module):
       # Evaluate network to output density
       x = inputs
       for i in range(self.net_depth):
+        if i > 0:
+          x = jnp.concatenate([x, inputs], axis=-1)
         x = dense_layer(self.net_width)(x)
         x = self.net_activation(x)
-        if i % self.skip_layer == 0 and i > 0:
-          x = jnp.concatenate([x, inputs], axis=-1)
+        # if i % self.skip_layer == 0 and i > 0:
+        #   x = jnp.concatenate([x, inputs], axis=-1)
       raw_density = dense_layer(1)(x)[Ellipsis, 0]  # Hardcoded to a single channel.
       # Add noise to regularize the density predictions if needed.
       if (rng is not None) and (self.density_noise > 0):

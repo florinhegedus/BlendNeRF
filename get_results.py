@@ -11,7 +11,7 @@ def get_mean(file_name):
     return sum(nums) / len(nums)
  
 
-def main(directory: str):
+def get_metrics_for_scene(directory: str):
     files = Path(directory).glob('*')
     for file in files:
         if 'psnr' in str(file):
@@ -25,7 +25,10 @@ def main(directory: str):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 2:
-        raise ValueError("Please provide directory.")
-    directory = sys.argv[1]
-    main(directory)
+    # scenes = ["fern", "flower", "fortress", "leaves", "orchids", "room", "trex"]
+    scenes = ["fern", "flower", "fortress"]
+    for scene in scenes:
+        directory = f"out/blendnerf_llff3_{scene}_wi/test_preds/"
+        print("--------------------------")
+        print(f"SCENE: {scene}")
+        get_metrics_for_scene(directory)
